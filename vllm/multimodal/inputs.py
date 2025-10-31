@@ -73,8 +73,8 @@ VideoItem: TypeAlias = Union[
     HfVideoItem, "torch.Tensor", tuple[HfVideoItem, dict[str, Any]]
 ]
 """
-A `transformers.video_utils.VideoInput` representing a single video item. 
-This can be passed to a HuggingFace `VideoProcessor` 
+A `transformers.video_utils.VideoInput` representing a single video item.
+This can be passed to a HuggingFace `VideoProcessor`
 with `transformers.video_utils.VideoMetadata`.
 
 Alternatively, a 3-D tensor or batch of 2-D tensors,
@@ -94,6 +94,24 @@ these are resampled to the model's sampling rate before being processed by HF.
 Alternatively, a 3-D tensor or batch of 2-D tensors,
 which are treated as audio embeddings;
 these are directly passed to the model without HF processing.
+"""
+
+TimeSeriesItem: TypeAlias = Union[
+    dict[str, Any],
+    tuple[list[str], list[float]],
+    tuple[list[float], list[float]],
+    "torch.Tensor",
+]
+"""
+Represents a single time series item.
+
+Can be specified as:
+- A dictionary with 'x' and 'y' keys, where 'x' contains timestamps (as strings
+  or floats) and 'y' contains values (as floats).
+- A tuple of (x_values, y_values), where x_values are timestamps (as strings
+  or floats) and y_values are float values.
+- A 2-D or 3-D tensor which is treated as time series embeddings;
+  these are directly passed to the model without processing.
 """
 
 ModalityData: TypeAlias = _T | list[_T | None] | None
@@ -118,6 +136,9 @@ class MultiModalDataBuiltins(TypedDict, total=False):
 
     audio: ModalityData[AudioItem]
     """The input audio(s)."""
+
+    time_series: ModalityData[TimeSeriesItem]
+    """The input time series data."""
 
 
 MultiModalDataDict: TypeAlias = Mapping[str, ModalityData[Any]]

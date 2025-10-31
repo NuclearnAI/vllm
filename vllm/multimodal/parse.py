@@ -270,6 +270,28 @@ class VideoEmbeddingItems(EmbeddingItems):
         super().__init__(data, "video")
 
 
+class TimeSeriesProcessorItems(ProcessorBatchItems[dict[str, Any]]):
+    def __init__(self, data: Sequence[dict[str, Any]] | None) -> None:
+        if data is None:
+            data = [None]
+        super().__init__(data, "time_series")
+
+    def get_series_length(self, item_idx: int) -> int:
+        """Get the length of a time series item."""
+        ts_data = self.get(item_idx)
+        if isinstance(ts_data, dict):
+            if "y" in ts_data:
+                return len(ts_data["y"])
+            elif "values" in ts_data:
+                return len(ts_data["values"])
+        return 0
+
+
+class TimeSeriesEmbeddingItems(EmbeddingItems):
+    def __init__(self, data: torch.Tensor | list[torch.Tensor]) -> None:
+        super().__init__(data, "time_series")
+
+
 _D = TypeVar("_D", bound=ModalityDataItems[Any, Any])
 
 
@@ -521,11 +543,59 @@ class MultiModalDataParser:
 
         return VideoProcessorItems(new_videos, metadata=metadata_lst)
 
+    def _parse_time_series_data(
+        self,
+        data: ModalityData[Any],
+    ) -> ModalityDataItems[Any, Any] | None:
+        """Parse time series data into TimeSeriesProcessorItems or TimeSeriesEmbeddingItems."""
+        if data is None:
+            return TimeSeriesProcessorItems(None)
+
+        if self._is_empty(data):
+            return None
+
+        if self._is_embeddings(data):
+            return TimeSeriesEmbeddingItems(data)
+
+        # Normalize to list of time series items
+        data_items: list[dict[str, Any]] = []
+
+        if isinstance(data, dict):
+            # Single time series as dict
+            data_items = [data]
+        elif isinstance(data, tuple) and len(data) == 2:
+            # Single time series as (x, y) tuple
+            x_vals, y_vals = data
+            data_items = [{"x": x_vals, "y": y_vals}]
+        elif isinstance(data, list):
+            # Multiple time series
+            for item in data:
+                if item is None:
+                    data_items.append(None)
+                elif isinstance(item, dict):
+                    data_items.append(item)
+                elif isinstance(item, tuple) and len(item) == 2:
+                    x_vals, y_vals = item
+                    data_items.append({"x": x_vals, "y": y_vals})
+                else:
+                    raise ValueError(
+                        f"Unsupported time series item type: {type(item)}. "
+                        "Expected dict or tuple of (x, y)."
+                    )
+        else:
+            raise ValueError(
+                f"Unsupported time series data type: {type(data)}. "
+                "Expected dict, tuple, list, or tensor."
+            )
+
+        return TimeSeriesProcessorItems(data_items)
+
     def _get_subparsers(self) -> Mapping[str, ModalityDataParser]:
         return {
             "audio": self._parse_audio_data,
             "image": self._parse_image_data,
             "video": self._parse_video_data,
+            "time_series": self._parse_time_series_data,
         }
 
     def parse_mm_data(self, mm_data: MultiModalDataDict) -> MultiModalDataItems:
