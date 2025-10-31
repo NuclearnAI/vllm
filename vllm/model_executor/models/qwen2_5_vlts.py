@@ -635,16 +635,67 @@ class Qwen2_5_VLTSMultiModalProcessor(Qwen2_5_VLMultiModalProcessor):
         """Get multimodal field configurations including time-series."""
         base_config = super()._get_mm_fields_config(hf_inputs, hf_processor_mm_kwargs)
 
-        # Add time-series specific field configurations
-        ts_fields = {
-            "ts_digits": MultiModalFieldConfig.flat("time_series", []),
-            "ts_digit_lengths": MultiModalFieldConfig.flat("time_series", []),
-            "datetimes": MultiModalFieldConfig.flat("time_series", []),
-            "time_series_grid_thw": MultiModalFieldConfig.batched("time_series"),
-            "batch_ts_seq_end_idxs": MultiModalFieldConfig.shared("time_series", 1),
-        }
+        # If we have time-series data, use the sophisticated processor to create configs
+        ts_fields = {}
+
+        # Check for time-series data in HF inputs
+        has_ts_data = any(key.startswith(('ts_', 'time_series_', 'datetimes')) for key in hf_inputs.keys())
+
+        if has_ts_data:
+            from ..multimodal.time_series import create_time_series_field_configs
+
+            # Extract time-series data for config creation
+            ts_data = {
+                key: value for key, value in hf_inputs.items()
+                if key.startswith(('ts_', 'time_series_', 'datetimes'))
+            }
+
+            if ts_data:
+                ts_fields = create_time_series_field_configs(ts_data)
+        else:
+            # Default time-series field configurations for basic compatibility
+            ts_fields = {
+                "ts_digits": MultiModalFieldConfig.flat("time_series", []),
+                "ts_digit_lengths": MultiModalFieldConfig.flat("time_series", []),
+                "datetimes": MultiModalFieldConfig.flat("time_series", []),
+                "time_series_grid_thw": MultiModalFieldConfig.batched("time_series"),
+                "batch_ts_seq_end_idxs": MultiModalFieldConfig.shared("time_series", 1),
+            }
 
         return {**base_config, **ts_fields}
+
+    def _process_time_series_inputs(
+        self,
+        mm_data: Dict[str, Any],
+        ts_preprocessor: Optional["Qwen2_5_TimeSeriesPreprocessor"] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Process time-series data using the sophisticated processor."""
+        from ..multimodal.time_series import TimeSeriesProcessor
+
+        # Use provided preprocessor config or defaults
+        if ts_preprocessor is not None:
+            processor = TimeSeriesProcessor(
+                ts_patch_size=ts_preprocessor.ts_patch_size,
+                ts_merge_size=ts_preprocessor.ts_merge_size,
+                ts_digit_pad=ts_preprocessor.ts_digit_pad,
+                ts_dec_digits=ts_preprocessor.ts_dec_digits,
+                ts_datetime_format=ts_preprocessor.ts_datetime_format,
+            )
+        else:
+            processor = TimeSeriesProcessor()
+
+        # Extract time-series values and datetimes from mm_data
+        time_series_values = mm_data.get("time_series_values")
+        time_series_datetimes = mm_data.get("time_series_datetimes")
+
+        if time_series_values is None or time_series_datetimes is None:
+            raise ValueError("Both time_series_values and time_series_datetimes must be provided")
+
+        # Process the batch
+        return processor.process_time_series_batch(
+            time_series_values=time_series_values,
+            time_series_datetimes=time_series_datetimes,
+        )
 
 
 # ===== Main Model Class ===== #
@@ -701,6 +752,18 @@ class Qwen2_5_VLTSForConditionalGeneration(
                 logger.warning(f"Could not load time-series preprocessor config: {e}")
                 self.ts_preprocessor = Qwen2_5_TimeSeriesPreprocessor()
 
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        """Get placeholder string for time-series tokens."""
+        if modality.startswith("image"):
+            return "<|vision_start|><|image_pad|><|vision_end|>"
+        if modality.startswith("video"):
+            return "<|vision_start|><|video_pad|><|vision_end|>"
+        if modality.startswith("time_series"):
+            return "<|ts_start|><|ts_pad|><|ts_end|>"
+
+        raise ValueError(f"Unsupported modality: {modality}")
+
     def get_language_model(self) -> nn.Module:
         return self.language_model
 
@@ -752,21 +815,66 @@ class Qwen2_5_VLTSForConditionalGeneration(
 
     def get_multimodal_embeddings(self, **kwargs: object) -> List[torch.Tensor]:
         """Get multimodal embeddings including time-series."""
-        # Parse time-series inputs if available
+        multimodal_embeddings = []
+
+        # Handle time-series inputs
         ts_inputs = self._parse_and_validate_ts_input(**kwargs)
-        if ts_inputs is None:
+        if ts_inputs is not None:
+            # Process time-series inputs
+            ts_embeddings = self.model.get_time_series_features(
+                ts_digits=ts_inputs["ts_digits"],
+                ts_digit_lengths=ts_inputs["ts_digit_lengths"],
+                datetimes=ts_inputs["datetimes"],
+                time_series_grid_thw=ts_inputs["time_series_grid_thw"],
+                batch_ts_seq_end_idxs=ts_inputs["batch_ts_seq_end_idxs"],
+            )
+
+            # Split embeddings by streams for multimodal framework
+            multimodal_embeddings.extend(self._split_ts_embeddings_by_stream(
+                ts_embeddings, ts_inputs["time_series_grid_thw"]
+            ))
+
+        # Handle other modalities (images, videos) if present
+        # This calls the parent implementation for image/video processing
+        try:
+            parent_embeddings = super().get_multimodal_embeddings(**kwargs)
+            multimodal_embeddings.extend(parent_embeddings)
+        except (AttributeError, TypeError):
+            # Parent doesn't support this method signature, that's OK
+            pass
+
+        return multimodal_embeddings
+
+    def _split_ts_embeddings_by_stream(
+        self,
+        ts_embeddings: torch.Tensor,
+        time_series_grid_thw: torch.Tensor
+    ) -> List[torch.Tensor]:
+        """Split time-series embeddings by stream for multimodal framework."""
+        if ts_embeddings.size(0) == 0:
             return []
 
-        # Process time-series inputs
-        ts_embeddings = self.model.get_time_series_features(
-            ts_digits=ts_inputs["ts_digits"],
-            ts_digit_lengths=ts_inputs["ts_digit_lengths"],
-            datetimes=ts_inputs["datetimes"],
-            time_series_grid_thw=ts_inputs["time_series_grid_thw"],
-            batch_ts_seq_end_idxs=ts_inputs["batch_ts_seq_end_idxs"],
-        )
+        # Calculate split points based on grid_thw
+        grid_list = time_series_grid_thw.tolist()
+        stream_sizes = [int(grid[0]) for grid in grid_list]  # T dimension (number of patches per stream)
 
-        return [ts_embeddings]
+        if sum(stream_sizes) != ts_embeddings.size(0):
+            logger.warning(
+                f"Time-series embedding size mismatch: expected {sum(stream_sizes)}, "
+                f"got {ts_embeddings.size(0)}. Using full tensor."
+            )
+            return [ts_embeddings]
+
+        # Split embeddings by stream
+        stream_embeddings = []
+        start_idx = 0
+        for size in stream_sizes:
+            if size > 0:
+                stream_emb = ts_embeddings[start_idx:start_idx + size]
+                stream_embeddings.append(stream_emb)
+                start_idx += size
+
+        return stream_embeddings
 
     def _parse_and_validate_ts_input(self, **kwargs: object) -> Optional[Dict[str, torch.Tensor]]:
         """Parse and validate time-series input."""
