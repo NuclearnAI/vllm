@@ -100,6 +100,9 @@ TimeSeriesItem: TypeAlias = Union[
     dict[str, Any],
     tuple[list[str], list[float]],
     tuple[list[float], list[float]],
+    # Enhanced support for nested ragged structures (Qwen2.5-VLTS format)
+    list[list[list[float]]],  # time_series_values: List[B][M][S]
+    tuple[list[list[list[float]]], Union[list[list[list[str]]], list[list[str]]]],  # (values, datetimes)
     "torch.Tensor",
 ]
 """
@@ -112,6 +115,9 @@ Can be specified as:
   or floats) and y_values are float values.
 - A 2-D or 3-D tensor which is treated as time series embeddings;
   these are directly passed to the model without processing.
+- Enhanced nested format for Qwen2.5-VLTS:
+  - List[List[List[float]]]: Ragged structure [batch][stream][timestep] values
+  - Tuple of (values, datetimes): Where datetimes can be per-timestep or broadcast
 """
 
 ModalityData: TypeAlias = _T | list[_T | None] | None

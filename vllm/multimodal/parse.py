@@ -284,7 +284,35 @@ class TimeSeriesProcessorItems(ProcessorBatchItems[dict[str, Any]]):
                 return len(ts_data["y"])
             elif "values" in ts_data:
                 return len(ts_data["values"])
+            elif "time_series_values" in ts_data:
+                # Handle nested Qwen2.5-VLTS format: List[B][M][S]
+                ts_values = ts_data["time_series_values"]
+                if isinstance(ts_values, list) and len(ts_values) > 0:
+                    # Return total timesteps across all streams for first batch
+                    if isinstance(ts_values[0], list):
+                        return sum(len(stream) for stream in ts_values[0])
+                    return len(ts_values)
         return 0
+
+    def get_total_streams(self, item_idx: int) -> int:
+        """Get the total number of streams for Qwen2.5-VLTS format."""
+        ts_data = self.get(item_idx)
+        if isinstance(ts_data, dict) and "time_series_values" in ts_data:
+            ts_values = ts_data["time_series_values"]
+            if isinstance(ts_values, list) and len(ts_values) > 0:
+                if isinstance(ts_values[0], list):
+                    return len(ts_values[0])  # Number of streams in first batch
+        return 1  # Default to single stream
+
+    def get_stream_lengths(self, item_idx: int) -> list[int]:
+        """Get lengths of each stream for Qwen2.5-VLTS format."""
+        ts_data = self.get(item_idx)
+        if isinstance(ts_data, dict) and "time_series_values" in ts_data:
+            ts_values = ts_data["time_series_values"]
+            if isinstance(ts_values, list) and len(ts_values) > 0:
+                if isinstance(ts_values[0], list):
+                    return [len(stream) for stream in ts_values[0]]
+        return [self.get_series_length(item_idx)]  # Fallback to total length
 
 
 class TimeSeriesEmbeddingItems(EmbeddingItems):
@@ -561,27 +589,56 @@ class MultiModalDataParser:
         data_items: list[dict[str, Any]] = []
 
         if isinstance(data, dict):
-            # Single time series as dict
-            data_items = [data]
+            # Single time series as dict - could be Qwen2.5-VLTS format
+            if "time_series_values" in data and "time_series_datetimes" in data:
+                # Qwen2.5-VLTS format with nested structure
+                data_items = [data]
+            else:
+                # Standard format
+                data_items = [data]
         elif isinstance(data, tuple) and len(data) == 2:
-            # Single time series as (x, y) tuple
-            x_vals, y_vals = data
-            data_items = [{"x": x_vals, "y": y_vals}]
+            # Could be (time_series_values, time_series_datetimes) or (x, y)
+            first, second = data
+            if isinstance(first, list) and len(first) > 0 and isinstance(first[0], list):
+                # Qwen2.5-VLTS format: (List[B][M][S], List[B][M][S] or List[B][S])
+                data_items = [{
+                    "time_series_values": first,
+                    "time_series_datetimes": second
+                }]
+            else:
+                # Standard (x, y) tuple
+                x_vals, y_vals = data
+                data_items = [{"x": x_vals, "y": y_vals}]
         elif isinstance(data, list):
-            # Multiple time series
-            for item in data:
-                if item is None:
-                    data_items.append(None)
-                elif isinstance(item, dict):
-                    data_items.append(item)
-                elif isinstance(item, tuple) and len(item) == 2:
-                    x_vals, y_vals = item
-                    data_items.append({"x": x_vals, "y": y_vals})
-                else:
-                    raise ValueError(
-                        f"Unsupported time series item type: {type(item)}. "
-                        "Expected dict or tuple of (x, y)."
-                    )
+            # Check if this is a nested Qwen2.5-VLTS format List[B][M][S]
+            if (len(data) > 0 and isinstance(data[0], list) and
+                len(data[0]) > 0 and isinstance(data[0][0], list)):
+                # This is time_series_values in Qwen2.5-VLTS format
+                data_items = [{
+                    "time_series_values": data,
+                    "time_series_datetimes": None  # Will need to be provided separately
+                }]
+            else:
+                # Multiple time series in standard format
+                for item in data:
+                    if item is None:
+                        data_items.append(None)
+                    elif isinstance(item, dict):
+                        data_items.append(item)
+                    elif isinstance(item, tuple) and len(item) == 2:
+                        x_vals, y_vals = item
+                        data_items.append({"x": x_vals, "y": y_vals})
+                    elif isinstance(item, list) and len(item) > 0 and isinstance(item[0], list):
+                        # Nested format within list
+                        data_items.append({
+                            "time_series_values": [item],  # Wrap in batch dimension
+                            "time_series_datetimes": None
+                        })
+                    else:
+                        raise ValueError(
+                            f"Unsupported time series item type: {type(item)}. "
+                            "Expected dict, tuple of (x, y), or nested list structure."
+                        )
         else:
             raise ValueError(
                 f"Unsupported time series data type: {type(data)}. "
